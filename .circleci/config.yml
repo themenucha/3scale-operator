@@ -7,10 +7,16 @@ parameters:
     default: "memcached:1.5"
   components_tag_name:
     type: string
-    default: "3scale-2.10.0-CR1"
+    default: "3scale-2.10.0-GA"
   components_imagestream_tag_name:
     type: string
     default: "2.10"
+  components_git_ref:
+    type: string
+    default: "3scale-2.10.0-GA"
+  build_3scale_images_flag:
+    type: boolean
+    default: false
 
 ##################################### YAML ANCHORS  ############################################
 
@@ -143,7 +149,6 @@ commands:
       - check-3scale-templates-openshift-events
       - check-3scale-templates-deployed-routes
 
-
   check-3scale-templates-deployed-deploymentconfigs:
     parameters:
       wildcard_domain:
@@ -255,6 +260,7 @@ commands:
       - check-3scale-templates-deployed-deploymentconfigs
       - check-3scale-templates-openshift-events
       - check-3scale-templates-deployed-routes
+
   push-3scale-images-to-quay:
     steps:
       - docker-login
@@ -322,6 +328,39 @@ commands:
             for bc in $(oc get bc --output=name); do oc start-build $bc --wait --follow; done
             echo "Finished waiting for the processes"
             oc delete events --all
+
+  build-amp-images:
+    steps:
+      - run:
+          name: Build 3scale images
+          no_output_timeout: 30m
+          command: |
+            set -o errexit
+            imagestream_tag_name=<< pipeline.parameters.components_imagestream_tag_name >>
+            oc new-app -f pkg/3scale/amp/auto-generated-templates/amp/amp-eval.yml \
+              --param AMP_BACKEND_IMAGE=quay.io/3scale/apisonator:nightly \
+              --param AMP_ZYNC_IMAGE=quay.io/3scale/zync:nightly \
+              --param AMP_APICAST_IMAGE=quay.io/3scale/apicast:nightly \
+              --param AMP_SYSTEM_IMAGE=quay.io/3scale/porta:nightly \
+              --param MEMCACHED_IMAGE=<< pipeline.parameters.memcached_image >> \
+              -o json --param WILDCARD_DOMAIN=lvh/me --param AMP_RELEASE="${imagestream_tag_name}" | \
+              jq -j '.items[] | select(.kind == "ImageStream")' | \
+              oc create -f -
+            oc new-app -f pkg/3scale/amp/manual-templates/amp/build.yml \
+              --allow-missing-imagestream-tags \
+              --param IMAGESTREAM_TAG_NAME="${imagestream_tag_name}" \
+              --param ZYNC_GIT_REF="<< pipeline.parameters.components_git_ref >>" \
+              --param PORTA_GIT_REF="<< pipeline.parameters.components_git_ref >>" \
+              --param APICAST_GIT_REF="<< pipeline.parameters.components_git_ref >>" \
+              --param APISONATOR_GIT_REF="<< pipeline.parameters.components_git_ref >>"
+            until (oc get is s2i-openresty-centos7 -o json || echo '{}') | jq '[.status.tags[] | select(.tag == "builder")] | length == 1' --exit-status; do
+              echo "wating for s2i-openresty-centos7:builder imagestream"
+              sleep 1
+            done
+            for bc in $(oc get bc --output=name); do oc start-build $bc --wait --follow; done
+            echo "Finished waiting for the processes"
+            oc delete events --all
+
   oc-observe:
     steps:
       - run:
@@ -574,58 +613,38 @@ jobs:
             cp _output/unit.cov coverage.txt
             bash <(curl -s https://codecov.io/bash)
 
+## NEW
+
+
+  build-push-3scale-images:
+    machine:
+      image: ubuntu-1604:202007-01
+      docker_layer_caching: true
+    resource_class: large
+    steps:
+      - run:
+          name: GITREF << pipeline.parameters.components_git_ref >>
+          command: |
+            exit 0
+      - run:
+          name: Remote Image TAG << pipeline.parameters.components_tag_name >>
+          command: |
+            exit 0
+      - checkout
+      - install-openshift
+      - create-secrets
+      - create-redhat-registry-io-secret
+      - build-amp-images
+      - oc-observe
+      - deploy-3scale-eval-from-template-imagestreamsless
+      - oc-status
+      - push-3scale-images-to-quay
+
 workflows:
   version: 2
-  operator:
+
+  images-build:
+    when: << pipeline.parameters.build_3scale_images_flag >>
     jobs:
-      - license-check
-      - test-crds
-      - test-manifests-version
-      - run-unit-tests
-      - install-operator
-      - run-operator-e2e-test:
-          requires:
-            - install-operator
-      - unit-tests-coverage:
-          requires:
-            - run-unit-tests
-          <<: *only-master-filter
-  templates:
-    jobs:
-      - generator
-      - deploy_templates:
-          requires:
-            - generator
-  nightly:
-    jobs:
-      - build-push-3scale-nightly-images:
+      - build-push-3scale-images:
           context: org-global
-      - deploy_templates:
-          requires:
-            - build-push-3scale-nightly-images
-      - install-operator
-      - run-operator-e2e-test:
-          requires:
-            - install-operator
-            - build-push-3scale-nightly-images
-    <<: *nightly-trigger
-  operator-release:
-    jobs:
-      - install-operator:
-          filters:
-            <<: *tag-trigger
-      - tag-operator-image-master:
-          context: org-global
-          requires:
-            - install-operator
-          filters:
-            branches:
-              only: master
-      - tag-operator-image-release:
-          context: org-global
-          requires:
-            - install-operator
-          filters:
-            <<: *tag-trigger
-            branches:
-              ignore: /.*/
