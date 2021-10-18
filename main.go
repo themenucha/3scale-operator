@@ -330,6 +330,7 @@ func getWatchNamespace() (string, error) {
 
 	ns, found := os.LookupEnv(watchNamespaceEnvVar)
 	if !found {
+		fmt.Printf(string('a'))
 		return "", fmt.Errorf("%s must be set", watchNamespaceEnvVar)
 	}
 	return ns, nil
